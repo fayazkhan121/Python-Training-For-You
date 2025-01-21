@@ -1,0 +1,88 @@
+import yfinance as yf
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+# Function to fetch stock data from Yahoo Finance
+def fetch_stock_data(ticker, start_date, end_date):
+    try:
+        stock = yf.Ticker(ticker)
+        data = stock.history(start=start_date, end=end_date)
+        data.reset_index(inplace=True)
+        return data
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to fetch data: {e}")
+        return None
+
+# Function to plot stock data
+def plot_stock_data(data, ticker):
+    plt.figure(figsize=(12, 6))
+    plt.plot(data['Date'], data['Close'], label=f"{ticker} Closing Price")
+    plt.xlabel("Date")
+    plt.ylabel("Price (USD)")
+    plt.title(f"{ticker} Closing Price Over Time")
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+# Function to handle user input and fetch data
+def get_stock_data():
+    ticker = ticker_entry.get().strip().upper()
+    start_date = start_date_entry.get().strip()
+    end_date = end_date_entry.get().strip()
+
+    if not ticker or not start_date or not end_date:
+        messagebox.showwarning("Input Error", "Please fill in all fields.")
+        return
+
+    try:
+        start_date_parsed = datetime.strptime(start_date, '%Y-%m-%d')
+        end_date_parsed = datetime.strptime(end_date, '%Y-%m-%d')
+
+        if start_date_parsed > end_date_parsed:
+            messagebox.showwarning("Date Error", "Start date must be before end date.")
+            return
+
+        stock_data = fetch_stock_data(ticker, start_date, end_date)
+
+        if stock_data is not None and not stock_data.empty:
+            plot_stock_data(stock_data, ticker)
+        else:
+            messagebox.showinfo("No Data", "No data available for the given period.")
+
+    except ValueError:
+        messagebox.showerror("Date Format Error", "Please use the YYYY-MM-DD format for dates.")
+    except Exception as e:
+        messagebox.showerror("Error", f"An error occurred: {e}")
+
+# Create the GUI application
+app = tk.Tk()
+app.title("Yahoo Finance Stock Data")
+app.geometry("400x300")
+
+# Ticker input
+ticker_label = tk.Label(app, text="Stock Ticker:")
+ticker_label.pack(pady=5)
+ticker_entry = tk.Entry(app, width=30)
+ticker_entry.pack(pady=5)
+
+# Start date input
+start_date_label = tk.Label(app, text="Start Date (YYYY-MM-DD):")
+start_date_label.pack(pady=5)
+start_date_entry = tk.Entry(app, width=30)
+start_date_entry.pack(pady=5)
+
+# End date input
+end_date_label = tk.Label(app, text="End Date (YYYY-MM-DD):")
+end_date_label.pack(pady=5)
+end_date_entry = tk.Entry(app, width=30)
+end_date_entry.pack(pady=5)
+
+# Fetch data button
+fetch_button = tk.Button(app, text="Fetch Data", command=get_stock_data)
+fetch_button.pack(pady=20)
+
+# Run the application
+app.mainloop()
