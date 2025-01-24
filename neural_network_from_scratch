@@ -1,37 +1,150 @@
 # Developing a Neural Network from Scratch
 # Description: Implementing a basic neural network using only numpy.
 # Key Libraries: numpy
-
 import numpy as np
 
+# Activation functions and their derivatives
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
 def sigmoid_derivative(x):
     return x * (1 - x)
 
-# Dataset
-inputs = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
-outputs = np.array([[0], [1], [1], [0]])
+def relu(x):
+    return np.maximum(0, x)
 
-# Weights
-input_weights = np.random.rand(2, 3)
-hidden_weights = np.random.rand(3, 1)
+def relu_derivative(x):
+    return np.where(x > 0, 1, 0)
 
-# Training
-for epoch in range(10000):
-    # Forward Propagation
-    hidden_layer = sigmoid(np.dot(inputs, input_weights))
-    output_layer = sigmoid(np.dot(hidden_layer, hidden_weights))
+# Neural Network Class
+class NeuralNetwork:
+    def __init__(self, layer_dims, activation='relu', learning_rate=0.01, reg_lambda=0.01):
+        """
+        Parameters:
+        - layer_dims: List of integers representing the number of neurons in each layer.
+        - activation: Activation function to use ('relu' or 'sigmoid').
+        - learning_rate: Learning rate for gradient descent.
+        - reg_lambda: L2 regularisation strength.
+        """
+        self.layer_dims = layer_dims
+        self.num_layers = len(layer_dims)
+        self.learning_rate = learning_rate
+        self.reg_lambda = reg_lambda
+        self.activation = activation
+        self.params = {}
+        self.initialise_weights()
+        self.activation_func = relu if activation == 'relu' else sigmoid
+        self.activation_derivative = relu_derivative if activation == 'relu' else sigmoid_derivative
 
-    # Backpropagation
-    error = outputs - output_layer
-    d_output = error * sigmoid_derivative(output_layer)
-    hidden_error = d_output.dot(hidden_weights.T)
-    d_hidden = hidden_error * sigmoid_derivative(hidden_layer)
+    def initialise_weights(self):
+        """
+        Randomly initialises weights and biases for each layer.
+        """
+        np.random.seed(42)  # For reproducibility
+        for i in range(1, self.num_layers):
+            self.params[f"W{i}"] = np.random.randn(self.layer_dims[i], self.layer_dims[i - 1]) * np.sqrt(2 / self.layer_dims[i - 1])
+            self.params[f"b{i}"] = np.zeros((self.layer_dims[i], 1))
 
-    # Update Weights
-    hidden_weights += hidden_layer.T.dot(d_output)
-    input_weights += inputs.T.dot(d_hidden)
+    def forward_propagation(self, X):
+        """
+        Implements forward propagation.
+        Returns:
+        - A: Final output
+        - cache: Dictionary containing intermediate values for backpropagation
+        """
+        A = X
+        cache = {'A0': X}
+        for i in range(1, self.num_layers):
+            Z = np.dot(self.params[f"W{i}"], A) + self.params[f"b{i}"]
+            A = self.activation_func(Z) if i < self.num_layers - 1 else sigmoid(Z)
+            cache[f"Z{i}"] = Z
+            cache[f"A{i}"] = A
+        return A, cache
 
-print(f"Output after training: {output_layer}")
+    def compute_cost(self, Y_hat, Y):
+        """
+        Computes the cost with L2 regularisation.
+        """
+        m = Y.shape[1]
+        cross_entropy_cost = -np.sum(Y * np.log(Y_hat) + (1 - Y) * np.log(1 - Y_hat)) / m
+        l2_regularisation_cost = (self.reg_lambda / (2 * m)) * sum(
+            [np.sum(np.square(self.params[f"W{i}"])) for i in range(1, self.num_layers)]
+        )
+        return cross_entropy_cost + l2_regularisation_cost
+
+    def backward_propagation(self, cache, Y):
+        """
+        Implements backward propagation.
+        Returns:
+        - grads: Dictionary containing gradients of weights and biases
+        """
+        grads = {}
+        m = Y.shape[1]
+        Y_hat = cache[f"A{self.num_layers - 1}"]
+        dA = -(np.divide(Y, Y_hat) - np.divide(1 - Y, 1 - Y_hat))
+        for i in reversed(range(1, self.num_layers)):
+            dZ = dA * (sigmoid_derivative(cache[f"A{i}"]) if i == self.num_layers - 1 else self.activation_derivative(cache[f"Z{i}"]))
+            grads[f"dW{i}"] = (np.dot(dZ, cache[f"A{i - 1}"].T) / m) + (self.reg_lambda / m) * self.params[f"W{i}"]
+            grads[f"db{i}"] = np.sum(dZ, axis=1, keepdims=True) / m
+            dA = np.dot(self.params[f"W{i}"].T, dZ)
+        return grads
+
+    def update_params(self, grads):
+        """
+        Updates weights and biases using gradient descent.
+        """
+        for i in range(1, self.num_layers):
+            self.params[f"W{i}"] -= self.learning_rate * grads[f"dW{i}"]
+            self.params[f"b{i}"] -= self.learning_rate * grads[f"db{i}"]
+
+    def fit(self, X, Y, epochs=1000, batch_size=64, verbose=False):
+        """
+        Trains the neural network using mini-batch gradient descent.
+        """
+        m = X.shape[1]
+        for epoch in range(1, epochs + 1):
+            # Shuffle and create mini-batches
+            permutation = np.random.permutation(m)
+            X_shuffled, Y_shuffled = X[:, permutation], Y[:, permutation]
+            for i in range(0, m, batch_size):
+                X_batch = X_shuffled[:, i:i + batch_size]
+                Y_batch = Y_shuffled[:, i:i + batch_size]
+
+                # Forward and backward propagation
+                Y_hat, cache = self.forward_propagation(X_batch)
+                grads = self.backward_propagation(cache, Y_batch)
+
+                # Update parameters
+                self.update_params(grads)
+
+            # Decay learning rate
+            if epoch % 100 == 0:
+                self.learning_rate *= 0.95
+
+            # Compute and display cost
+            if verbose and epoch % 100 == 0:
+                Y_hat_full, _ = self.forward_propagation(X)
+                cost = self.compute_cost(Y_hat_full, Y)
+                print(f"Epoch {epoch}, Cost: {cost:.4f}")
+
+    def predict(self, X):
+        """
+        Predicts outputs for given inputs.
+        """
+        Y_hat, _ = self.forward_propagation(X)
+        return (Y_hat > 0.5).astype(int)
+
+
+# Usage Example
+if __name__ == "__main__":
+    # Dataset: XOR Problem
+    X = np.array([[0, 0, 1, 1], [0, 1, 0, 1]])  # Input features
+    Y = np.array([[0, 1, 1, 0]])                # Labels
+
+    # Neural Network
+    nn = NeuralNetwork(layer_dims=[2, 4, 3, 1], activation='relu', learning_rate=0.1, reg_lambda=0.01)
+    nn.fit(X, Y, epochs=2000, verbose=True)
+
+    # Predictions
+    predictions = nn.predict(X)
+    print("Predictions:", predictions)
