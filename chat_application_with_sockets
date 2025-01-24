@@ -1,0 +1,29 @@
+# Designing a Chat Application with Sockets
+# Description: Implementing a client-server chat application using socket programming.
+# Key Libraries: socket, threading
+
+import socket
+import threading
+
+# Server
+def handle_client(client_socket):
+    while True:
+        message = client_socket.recv(1024).decode()
+        if message == 'exit':
+            break
+        print(f"Client: {message}")
+        client_socket.send("Message received!".encode())
+    client_socket.close()
+
+def server():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind(("0.0.0.0", 9999))
+    server_socket.listen(5)
+    print("Server started...")
+    while True:
+        client_socket, addr = server_socket.accept()
+        print(f"Connection from {addr}")
+        threading.Thread(target=handle_client, args=(client_socket,)).start()
+
+# Run server
+threading.Thread(target=server).start()
