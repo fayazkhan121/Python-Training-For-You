@@ -1,0 +1,37 @@
+# Developing a Neural Network from Scratch
+# Description: Implementing a basic neural network using only numpy.
+# Key Libraries: numpy
+
+import numpy as np
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def sigmoid_derivative(x):
+    return x * (1 - x)
+
+# Dataset
+inputs = np.array([[0, 0], [0, 1], [1, 0], [1, 1]])
+outputs = np.array([[0], [1], [1], [0]])
+
+# Weights
+input_weights = np.random.rand(2, 3)
+hidden_weights = np.random.rand(3, 1)
+
+# Training
+for epoch in range(10000):
+    # Forward Propagation
+    hidden_layer = sigmoid(np.dot(inputs, input_weights))
+    output_layer = sigmoid(np.dot(hidden_layer, hidden_weights))
+
+    # Backpropagation
+    error = outputs - output_layer
+    d_output = error * sigmoid_derivative(output_layer)
+    hidden_error = d_output.dot(hidden_weights.T)
+    d_hidden = hidden_error * sigmoid_derivative(hidden_layer)
+
+    # Update Weights
+    hidden_weights += hidden_layer.T.dot(d_output)
+    input_weights += inputs.T.dot(d_hidden)
+
+print(f"Output after training: {output_layer}")
