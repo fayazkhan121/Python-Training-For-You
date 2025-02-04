@@ -1,0 +1,368 @@
+import os
+import cv2
+import librosa
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.models as models
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertModel, BertTokenizer
+
+# =============================================================================
+# Positional Encoding for Transformer (used in Audio branch)
+# =============================================================================
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        """
+        Adds sinusoidal positional encoding to the input tensor.
+        """
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(dropout)
+        
+        # Create constant 'pe' matrix with values dependent on pos and i
+        pe = torch.zeros(max_len, d_model)  # shape: (max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # Compute the positional encodings once in log space.
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        pe = pe.unsqueeze(0)  # shape: (1, max_len, d_model)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (batch, seq_len, d_model)
+        Returns:
+            Tensor with positional encodings added.
+        """
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+# =============================================================================
+# Utility Functions for Preprocessing
+# =============================================================================
+def preprocess_frame(frame, target_size=(224, 224)):
+    """
+    Convert BGR image (from OpenCV) to RGB, resize, normalize, and reformat.
+    """
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = cv2.resize(frame, target_size)
+    frame = frame.astype(np.float32) / 255.0
+    # Normalize using ImageNet means and standard deviations
+    mean = np.array([0.485, 0.456, 0.406])
+    std  = np.array([0.229, 0.224, 0.225])
+    frame = (frame - mean) / std
+    # Convert to (C, H, W)
+    frame = np.transpose(frame, (2, 0, 1))
+    return frame
+
+def extract_video_frames(video_path, num_frames=16, target_size=(224, 224)):
+    """
+    Uniformly sample a fixed number of frames from a video file.
+    """
+    cap = cv2.VideoCapture(video_path)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames <= 0:
+        # If video cannot be read, return an array of zeros.
+        cap.release()
+        return np.zeros((num_frames, 3, target_size[0], target_size[1]), dtype=np.float32)
+    # Uniformly sample indices
+    frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            processed_frame = preprocess_frame(frame, target_size)
+            frames.append(processed_frame)
+        else:
+            # If reading fails, pad with zeros.
+            frames.append(np.zeros((3, target_size[0], target_size[1]), dtype=np.float32))
+    cap.release()
+    frames = np.stack(frames, axis=0)  # shape: (num_frames, 3, H, W)
+    return frames
+
+def extract_mfcc(audio_path, sr=22050, n_mfcc=40, max_pad_len=200):
+    """
+    Extract MFCC features from an audio file and pad/truncate to a fixed length.
+    """
+    y, sr = librosa.load(audio_path, sr=sr)
+    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)  # shape: (n_mfcc, time)
+    mfcc = mfcc.T  # shape: (time, n_mfcc)
+    if mfcc.shape[0] < max_pad_len:
+        pad_width = max_pad_len - mfcc.shape[0]
+        mfcc = np.pad(mfcc, pad_width=((0, pad_width), (0, 0)), mode='constant')
+    else:
+        mfcc = mfcc[:max_pad_len, :]
+    return mfcc  # shape: (max_pad_len, n_mfcc)
+
+# =============================================================================
+# Define the Dataset for Multimodal Data
+# =============================================================================
+class MultimodalEmotionDataset(Dataset):
+    """
+    Dataset that loads synchronized video, audio, and text samples with emotion labels.
+    Each sample is assumed to have:
+      - 'video_path': path to a video file.
+      - 'audio_path': path to an audio file.
+      - 'text': transcript.
+      - 'label': integer emotion label.
+    """
+    def __init__(self, samples, tokenizer, num_frames=16, max_audio_len=200, max_text_len=128):
+        self.samples = samples
+        self.tokenizer = tokenizer
+        self.num_frames = num_frames
+        self.max_audio_len = max_audio_len
+        self.max_text_len = max_text_len
+        self.n_mfcc = 40
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        # --- Video: extract a fixed number of frames ---
+        video_frames = extract_video_frames(sample['video_path'], num_frames=self.num_frames)
+        # Convert to tensor: shape (num_frames, 3, 224, 224)
+        video_tensor = torch.tensor(video_frames, dtype=torch.float)
+        
+        # --- Audio: extract MFCC features ---
+        mfcc_features = extract_mfcc(sample['audio_path'], n_mfcc=self.n_mfcc, max_pad_len=self.max_audio_len)
+        audio_tensor = torch.tensor(mfcc_features, dtype=torch.float)  # shape: (max_audio_len, n_mfcc)
+        
+        # --- Text: tokenize ---
+        encoding = self.tokenizer(
+            sample['text'],
+            truncation=True,
+            padding='max_length',
+            max_length=self.max_text_len,
+            return_tensors='pt'
+        )
+        input_ids = encoding['input_ids'].squeeze(0)
+        attention_mask = encoding['attention_mask'].squeeze(0)
+        
+        # --- Label ---
+        label = torch.tensor(sample['label'], dtype=torch.long)
+        
+        return video_tensor, audio_tensor, input_ids, attention_mask, label
+
+# =============================================================================
+# Define the Model Branches
+# =============================================================================
+
+# ----- Video Branch using a CNN + Transformer Encoder -----
+class VideoTransformerBranch(nn.Module):
+    def __init__(self, num_frames=16, d_model=128, nhead=8, num_layers=1):
+        """
+        Process a sequence of video frames:
+          - Extract spatial features with a pretrained ResNet.
+          - Project features and process with a Transformer encoder for temporal modeling.
+        """
+        super(VideoTransformerBranch, self).__init__()
+        self.num_frames = num_frames
+        self.cnn = models.resnet18(pretrained=True)
+        # Remove the final fully connected layer to extract features.
+        self.cnn.fc = nn.Identity()  # output: 512-dim vector per frame.
+        # Project CNN features to d_model.
+        self.project = nn.Linear(512, d_model)
+        # Transformer encoder for temporal modeling (batch_first=True available in PyTorch 1.9+)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, frames):
+        """
+        Args:
+            frames: Tensor of shape (batch, num_frames, 3, 224, 224)
+        Returns:
+            video_feature: Tensor of shape (batch, d_model)
+        """
+        batch, num_frames, C, H, W = frames.shape
+        # Merge batch and time: process each frame individually.
+        frames = frames.view(-1, C, H, W)  # shape: (batch*num_frames, 3, 224, 224)
+        features = self.cnn(frames)         # shape: (batch*num_frames, 512)
+        features = self.project(features)   # shape: (batch*num_frames, d_model)
+        # Reshape back to (batch, num_frames, d_model)
+        features = features.view(batch, num_frames, -1)
+        # Process with Transformer to capture temporal dependencies.
+        features = self.transformer_encoder(features)  # shape: (batch, num_frames, d_model)
+        # Aggregate over time (mean pooling).
+        video_feature = features.mean(dim=1)  # shape: (batch, d_model)
+        return video_feature
+
+# ----- Audio Branch using a Transformer Encoder -----
+class AudioTransformerBranch(nn.Module):
+    def __init__(self, n_mfcc=40, d_model=128, nhead=8, num_layers=1, max_audio_len=200):
+        """
+        Process MFCC features with a Transformer encoder.
+        """
+        super(AudioTransformerBranch, self).__init__()
+        # Project MFCC features to d_model.
+        self.input_proj = nn.Linear(n_mfcc, d_model)
+        self.pos_encoder = PositionalEncoding(d_model=d_model, dropout=0.1, max_len=max_audio_len)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+    def forward(self, mfcc):
+        """
+        Args:
+            mfcc: Tensor of shape (batch, time, n_mfcc)
+        Returns:
+            audio_feature: Tensor of shape (batch, d_model)
+        """
+        x = self.input_proj(mfcc)   # shape: (batch, time, d_model)
+        x = self.pos_encoder(x)     # add positional information
+        x = self.transformer_encoder(x)  # shape: (batch, time, d_model)
+        # Aggregate over time.
+        audio_feature = x.mean(dim=1)  # shape: (batch, d_model)
+        return audio_feature
+
+# ----- Text Branch using Pretrained BERT -----
+class TextBranch(nn.Module):
+    def __init__(self, d_model=128):
+        """
+        Process text with a pretrained BERT model and project to d_model.
+        """
+        super(TextBranch, self).__init__()
+        self.bert = BertModel.from_pretrained("bert-base-uncased")
+        self.project = nn.Linear(self.bert.config.hidden_size, d_model)
+
+    def forward(self, input_ids, attention_mask):
+        """
+        Args:
+            input_ids: Tensor of token IDs.
+            attention_mask: Tensor for attention mask.
+        Returns:
+            text_feature: Tensor of shape (batch, d_model)
+        """
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.pooler_output  # shape: (batch, hidden_size)
+        text_feature = self.project(pooled_output)  # shape: (batch, d_model)
+        return text_feature
+
+# ----- Fusion Module: Cross‑Modal Transformer Fusion -----
+class FusionModule(nn.Module):
+    def __init__(self, d_model=128, nhead=8, num_layers=1, num_modalities=3, num_classes=7):
+        """
+        Fuse modality-specific features using a Transformer encoder.
+        """
+        super(FusionModule, self).__init__()
+        # You can add a learned modality embedding if desired. Here we assume the features
+        # from each branch are already in the same d_model space.
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.fusion_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # Final classification head.
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(d_model, num_classes)
+        )
+
+    def forward(self, video_feature, audio_feature, text_feature):
+        """
+        Args:
+            video_feature, audio_feature, text_feature: Tensors of shape (batch, d_model)
+        Returns:
+            logits: Tensor of shape (batch, num_classes)
+        """
+        # Stack modalities to shape: (batch, num_modalities, d_model)
+        modalities = torch.stack([video_feature, audio_feature, text_feature], dim=1)
+        # Process with the fusion transformer.
+        fused = self.fusion_transformer(modalities)  # shape: (batch, num_modalities, d_model)
+        # Aggregate across modalities (e.g., mean pooling).
+        fused_feature = fused.mean(dim=1)  # shape: (batch, d_model)
+        logits = self.classifier(fused_feature)
+        return logits
+
+# =============================================================================
+# The Complete Multimodal Emotion Recognition Model
+# =============================================================================
+class MultimodalEmotionRecognizer(nn.Module):
+    def __init__(self, num_frames=16, d_model=128, nhead=8, num_layers=1,
+                 max_audio_len=200, num_classes=7, n_mfcc=40):
+        super(MultimodalEmotionRecognizer, self).__init__()
+        self.video_branch = VideoTransformerBranch(num_frames=num_frames, d_model=d_model,
+                                                   nhead=nhead, num_layers=num_layers)
+        self.audio_branch = AudioTransformerBranch(n_mfcc=n_mfcc, d_model=d_model, nhead=nhead,
+                                                   num_layers=num_layers, max_audio_len=max_audio_len)
+        self.text_branch = TextBranch(d_model=d_model)
+        self.fusion = FusionModule(d_model=d_model, nhead=nhead, num_layers=num_layers,
+                                   num_modalities=3, num_classes=num_classes)
+
+    def forward(self, video_frames, audio_mfcc, input_ids, attention_mask):
+        video_feat = self.video_branch(video_frames)        # (batch, d_model)
+        audio_feat = self.audio_branch(audio_mfcc)           # (batch, d_model)
+        text_feat  = self.text_branch(input_ids, attention_mask)  # (batch, d_model)
+        logits = self.fusion(video_feat, audio_feat, text_feat)
+        return logits
+
+# =============================================================================
+# Example Training Loop with Dummy Data
+# =============================================================================
+def main():
+    # Initialize the BERT tokenizer.
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+
+    # Create a list of dummy samples.  
+    # In a real scenario, replace the paths with valid file paths and adjust labels.
+    samples = [
+        {
+            'video_path': 'data/sample_video1.mp4',  # path to a video file
+            'audio_path': 'data/sample_audio1.wav',    # path to an audio file
+            'text': "I feel fantastic and full of energy!",
+            'label': 0  # e.g., 0 = happy
+        },
+        {
+            'video_path': 'data/sample_video2.mp4',
+            'audio_path': 'data/sample_audio2.wav',
+            'text': "Everything seems to be going wrong today.",
+            'label': 1  # e.g., 1 = sad/angry
+        },
+        # Add more samples as needed...
+    ]
+    
+    # Create the dataset and DataLoader.
+    dataset = MultimodalEmotionDataset(samples, tokenizer, num_frames=16, max_audio_len=200, max_text_len=32)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=True, num_workers=0)
+    
+    # Set up device, model, loss, and optimizer.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = MultimodalEmotionRecognizer(num_frames=16, d_model=128, nhead=8, num_layers=1,
+                                        max_audio_len=200, num_classes=7, n_mfcc=40)
+    model = model.to(device)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    
+    # Dummy training loop (for demonstration purposes)
+    num_epochs = 5
+    model.train()
+    for epoch in range(num_epochs):
+        running_loss = 0.0
+        for batch in dataloader:
+            video, audio, input_ids, attention_mask, labels = batch
+            # video: (batch, num_frames, 3, 224, 224)
+            video = video.to(device)
+            # audio: (batch, time, n_mfcc)
+            audio = audio.to(device)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(video, audio, input_ids, attention_mask)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * video.size(0)
+        
+        epoch_loss = running_loss / len(dataset)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}")
+    
+    print("Training complete.")
+
+if __name__ == '__main__':
+    main()
